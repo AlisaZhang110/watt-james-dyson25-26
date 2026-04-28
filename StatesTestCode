@@ -1,0 +1,277 @@
+  #include <Wire.h>
+  #include <Adafruit_GFX.h>
+  #include <Adafruit_SSD1306.h>
+  #include <Adafruit_Sensor.h>
+  #include <Adafruit_BME280.h>
+  #include <WiFi.h>
+  #include <HTTPClient.h>
+  #include "time.h"
+
+  const char* ssid = "THINKPAD-ALISA 9336";
+  const char* password = "8978V#g3";
+
+  // --- Time Settings ---
+  const char* ntpServer = "pool.ntp.org";
+  const long  gmtOffset_sec = -28800; // UTC-8 for PDT
+  const int   daylightOffset_sec = 3600;
+
+  // --- Pin Definitions ---
+  #define DUST_AOUT 34
+  #define DUST_ILED 32
+  #define BUTTON_PIN 33
+  #define BUZZER_PIN 25
+
+  // --- OLED & Sensor Objects ---
+  Adafruit_SSD1306 display(128, 64, &Wire, -1);
+  Adafruit_BME280 bme;
+
+  // --- Thresholds & Timers (in Seconds for Epoch Time) ---
+  const float MODERATE_DUST_THRESHOLD = 100.0;
+  const float EXTREME_DUST_THRESHOLD = 200.0;  
+
+  const time_t MODERATE_TIME_LIMIT_SEC = 45 * 60; // 45 mins
+  const time_t SOS_TIME_LIMIT_SEC = 5 * 60;       // 5 mins
+  const time_t SNOOZE_DURATION_SEC = 15 * 60;     // 15 mins
+  const uint64_t SLEEP_DURATION_US = 60ULL * 1000000ULL; // 60 seconds
+
+  // --- RTC MEMORY VARIABLES (These survive Deep Sleep!) ---
+  enum State { NORMAL, WARNING, SNOOZED, SOS };
+  RTC_DATA_ATTR State systemState = NORMAL;
+  RTC_DATA_ATTR int bootCount = 0;
+  RTC_DATA_ATTR time_t moderateStartEpoch = 0;
+  RTC_DATA_ATTR time_t warningStartEpoch = 0;
+  RTC_DATA_ATTR time_t snoozeStartEpoch = 0;
+
+  // --- Global Variables (Reset on wake) ---
+  float tempC = 0.0;
+  float humidity = 0.0;
+  float dustDensity = 0.0;
+  bool sosSent = false;
+
+  void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+  delay(500);
+
+  // OLED FIRST (critical)
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed");
+    while(true);
+  }
+  delay(100);
+  display.clearDisplay();
+  display.display();
+  
+  if(!bme.begin(0x76)) {
+      Serial.println("BME failed");
+      while(true);
+    }
+
+    // 1. FIRST BOOT ONLY: Connect to Wi-Fi to sync the exact time
+    if (bootCount == 0) {
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 10);
+      display.print("Syncing Time...");
+      display.display();
+
+      WiFi.begin(ssid, password);
+      while (WiFi.status() != WL_CONNECTED) { delay(500); }
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      
+      // Wait until time is actually set
+      time_t now = time(nullptr);
+      while (now < 24 * 3600) { delay(100); now = time(nullptr); }
+      
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF); // Turn off Wi-Fi to save battery
+      bootCount++;
+    }
+
+    // 2. WAKE UP & READ SENSORS
+    readSensors();
+    evaluateAirQuality();
+    updateDisplay();
+
+    // 3. SLEEP OR PANIC DECISION
+    if (systemState == NORMAL || systemState == SNOOZED) {
+      // Air is fine (or snoozed). Set wake triggers and go to sleep.
+      esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+      
+      // Wake up if button is pressed (ext0 requires pin to go LOW)
+      esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0); 
+      
+      Serial.println("Going to Deep Sleep...");
+      esp_deep_sleep_start();
+    }
+    
+    // If the code reaches here, systemState is WARNING or SOS. 
+    // We DO NOT go to sleep. We proceed directly to loop() to handle the emergency.
+  }
+
+  void loop() {
+    // This loop ONLY runs during an active emergency (WARNING or SOS)
+    time_t currentEpoch = time(nullptr);
+
+    // Handle Button Press (Snooze the alarm)
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      delay(50);
+      if (digitalRead(BUTTON_PIN) == LOW) {
+        systemState = SNOOZED;
+        snoozeStartEpoch = currentEpoch;
+        noTone(BUZZER_PIN);
+        updateDisplay();
+        
+        // Go back to deep sleep since we snoozed
+        esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+        esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);
+        esp_deep_sleep_start();
+      }
+    }
+
+    // Active Warning Beep
+    if (systemState == WARNING) {
+      tone(BUZZER_PIN, 1000);
+      delay(100);
+      noTone(BUZZER_PIN);
+      delay(100);
+      
+      if (currentEpoch - warningStartEpoch >= SOS_TIME_LIMIT_SEC) {
+        systemState = SOS;
+      }
+    } 
+    
+    // Active SOS
+    else if (systemState == SOS) {
+      tone(BUZZER_PIN, 2000); // Continuous beep
+      if (!sosSent) {
+        sendSOSWebhook();
+        sosSent = true;
+      }
+      delay(200); // Small delay for loop stability
+    }
+  }
+
+  void readSensors() {
+    tempC = bme.readTemperature();
+    humidity = bme.readHumidity();
+
+    digitalWrite(DUST_ILED, LOW);
+    delayMicroseconds(280);
+    int voMeasured = analogRead(DUST_AOUT);
+    delayMicroseconds(40);
+    digitalWrite(DUST_ILED, HIGH);
+    delayMicroseconds(9680);
+
+    float calcVoltage = voMeasured * (3.3 / 4095.0);
+    dustDensity = 170 * calcVoltage - 0.1;
+    if (dustDensity < 0) dustDensity = 0.0;
+  }
+
+  void evaluateAirQuality() {
+    time_t currentEpoch = time(nullptr);
+
+    // Check if snooze has expired
+    if (systemState == SNOOZED) {
+      if (currentEpoch - snoozeStartEpoch >= SNOOZE_DURATION_SEC) {
+        systemState = NORMAL; // Re-evaluate
+      } else {
+        return; // Still snoozing, do nothing
+      }
+    }
+
+    if (systemState == SOS) return; // Once in SOS, stay in SOS
+
+    if (dustDensity >= EXTREME_DUST_THRESHOLD) {
+      if (systemState != WARNING) {
+        systemState = WARNING;
+        warningStartEpoch = currentEpoch;
+      }
+    } 
+    else if (dustDensity >= MODERATE_DUST_THRESHOLD) {
+      if (moderateStartEpoch == 0) moderateStartEpoch = currentEpoch;
+      
+      if (currentEpoch - moderateStartEpoch >= MODERATE_TIME_LIMIT_SEC) {
+        if (systemState != WARNING) {
+          systemState = WARNING;
+          warningStartEpoch = currentEpoch;
+        }
+      }
+    } 
+    else {
+      moderateStartEpoch = 0; 
+      systemState = NORMAL;
+    }
+  }
+
+  void sendSOSWebhook() {
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) delay(500);
+
+    HTTPClient http;
+    http.begin("https://discord.com/api/webhooks/1498741485665783921/-iLJibwVzMf-0C3PvjFMZUWTNuRSSQgZKzAkXFxkFj8H5n-_UTyz5TDoen-X7v4F7qm4");
+    http.addHeader("Content-Type", "application/json");
+
+    String payload = "{\"content\": \"🚨 SOS: Dangerous air quality detected!\"}";
+    http.POST(payload);
+
+    http.end();
+  }
+
+  void updateDisplay() {
+    display.clearDisplay();
+
+    if (systemState == WARNING) {
+      display.setTextSize(2);
+      display.setCursor(10, 20);
+      display.print("WARNING!");
+      display.setTextSize(1);
+      display.setCursor(10, 45);
+      display.print("High PM2.5 detected");
+    } 
+    else if (systemState == SOS) {
+      display.setTextSize(2);
+      display.setCursor(40, 20);
+      display.print("SOS");
+      display.setTextSize(1);
+      display.setCursor(5, 45);
+      if(sosSent) display.print("Emergency Notified!");
+      else display.print("Triggering SOS...");
+    } 
+    else {
+      // Normal/Snooze Weather Station UI
+      struct tm timeinfo;
+      if(getLocalTime(&timeinfo)){
+        display.setTextSize(2);
+        display.setCursor(35, 0);
+        if(timeinfo.tm_hour < 10) display.print("0");
+        display.print(timeinfo.tm_hour);
+        display.print(":");
+        if(timeinfo.tm_min < 10) display.print("0");
+        display.print(timeinfo.tm_min);
+      }
+
+      display.setTextSize(1);
+      display.setCursor(0, 25);
+      display.print("Temp: ");
+      display.print(tempC);
+      display.print(" C");
+      
+      display.setCursor(0, 35);
+      display.print("Hum:  ");
+      display.print(humidity);
+      display.print(" %");
+
+      display.setCursor(0, 50);
+      display.print("PM2.5: ");
+      display.print(dustDensity);
+      
+      if (systemState == SNOOZED) {
+        display.setCursor(100, 50);
+        display.print("(Zzz)");
+      }
+    }
+    display.display();
+  }
